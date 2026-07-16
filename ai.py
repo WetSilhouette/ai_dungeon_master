@@ -6,7 +6,11 @@ import ast
 MODEL = "gemma4"
 
 JSON_FORMAT = {"scene": "...", "actions": ["...", "...", "..."]}
-TURN_JSON_FORMAT = {"result": "...", "actions": ["...", "...", "..."]}
+TURN_JSON_FORMAT = {
+    "result": "...",
+    "actions": ["...", "...", "..."],
+    "updates": {"hp": -15, "gold": 10, "inventory": {"add": ["item"], "remove": ["item"]}}
+}
 
 
 def clean_response(raw):
@@ -25,7 +29,7 @@ async def model_response(prompt) -> dict:
         result = json.loads(cleaned)
     except json.JSONDecodeError:
         try:
-            result = json.loads(ast.literal_eval(cleaned))
+            result = ast.literal_eval(cleaned)
         except (ValueError, SyntaxError) as e:
             raise ValueError(
                 f"Model did not return valid JSON or a valid Python literal. Raw response was: \n{cleaned}"
@@ -34,7 +38,19 @@ async def model_response(prompt) -> dict:
     if not isinstance(result, dict):
         raise ValueError(f"Expected a JSON object, got {type(result).__name__}: {result!r}")
 
+    if isinstance(result.get("actions"), list):
+        result["actions"] = [normalize_action(item) for item in result["actions"]]
+
     return result
+
+
+def normalize_action(item) -> str:
+    """The model occasionally returns an action as an object instead of a plain string."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("action") or item.get("text") or item)
+    return str(item)
 
 
 async def start_game(game_input) -> dict:
@@ -50,10 +66,16 @@ async def start_game(game_input) -> dict:
     return result
 
 
-async def continue_game(game_history) -> dict:
-    prompt = f"""You are a dungeon master. Continue a game with such actions history and world building {game_history}. Write a 3-5 sentence continuation scene. 
-                Then provide exactly 3 possible actions as a JSON array. 
-                Return ONLY: {TURN_JSON_FORMAT}"""
+async def continue_game(game_history, stats) -> dict:
+    prompt = f"""You are a dungeon master. Continue a game with such actions history and world building {game_history}.
+                Current character stats: {json.dumps(stats)}.
+                Write a 3-5 sentence continuation scene that reflects the outcome of the player's latest action.
+                Then provide exactly 3 possible actions as a JSON array.
+                If the latest action changes HP, gold, or inventory in any way (taking damage, defeating an
+                enemy, looting, finding or using an item, etc.), you MUST include an "updates" key with deltas
+                for only the fields that changed (e.g. -15 for damage taken, 10 for gold found). Omit "updates"
+                entirely only if nothing changed.
+                Return ONLY valid JSON in this exact shape, using double quotes for all keys and strings: {TURN_JSON_FORMAT}"""
 
     result = await model_response(prompt)
     return result

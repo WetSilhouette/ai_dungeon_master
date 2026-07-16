@@ -25,11 +25,13 @@ async def init_db() -> None:
             turn_number INT NOT NULL,
             action TEXT NOT NULL,
             result TEXT NOT NULL,
+            stats TEXT DEFAULT '{...}',
             FOREIGN KEY (game_id) REFERENCES games (game_id)
             )""")
         await db.commit()
 
 
+# Save the newly created game in /games
 async def save_game(game_id: str, game_inputs) -> int:
     player_name = game_inputs.player_name
     setting = game_inputs.setting
@@ -46,6 +48,7 @@ async def save_game(game_id: str, game_inputs) -> int:
         return cursor.lastrowid
 
 
+# Get last row from character's turns for this game_id
 async def get_last_turn(game_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
@@ -58,6 +61,7 @@ async def get_last_turn(game_id: str):
         return await cursor.fetchone()
 
 
+# Get all rows from character's turns for this game_id
 async def get_game_history(game_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
@@ -69,19 +73,21 @@ async def get_game_history(game_id: str):
         return await cursor.fetchall()
 
 
-async def take_action_db(game_id: str, action: str, result: str, turn_number: int) -> int:
+# Add character's turn to the 'turns' table
+async def take_action_db(game_id: str, action: str, result: str, turn_number: int, stats: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
 
         cursor = await db.execute("""
-            INSERT INTO turns (game_id, turn_number, action, result)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO turns (game_id, turn_number, action, result, stats)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (game_id, turn_number, action, result)
+            (game_id, turn_number, action, result, stats)
             )
         await db.commit()
         return cursor.lastrowid
 
 
+# Update turn action to character's choice
 async def update_action(game_id: str, action: str, turn_number: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
