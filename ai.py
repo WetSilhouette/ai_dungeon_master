@@ -109,6 +109,7 @@ async def continue_game(game_history, stats, location: dict | None = None, arriv
                 Return ONLY valid JSON in this exact shape, using double quotes for all keys and strings: {TURN_JSON_FORMAT}"""
 
     result = await model_response(prompt)
+    print(result)
     return result
 
 

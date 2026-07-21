@@ -281,6 +281,13 @@ def filter_blocked_exits(exits: list, blocked_locations: set) -> list:
     return [(exit_id, name) for exit_id, name in exits if exit_id not in blocked_locations]
 
 
+def print_turn(turn_number: int, choice: str, description: str, next_actions: List[str]) -> None:
+    print(f"\n--- Turn {turn_number} ---")
+    print(f"Choice: {choice or '(none - opening scene)'}")
+    print(f"Description: {description}")
+    print(f"Next actions: {next_actions}")
+
+
 async def check_achievements(game_id: str, ctx: dict) -> List[str]:
     """Award any achievements newly satisfied by the current game state. Each is awarded once per game."""
     earned_ids = {row[0] for row in await get_earned_achievements(game_id)}
@@ -392,6 +399,8 @@ async def create_game(game: GameInput):
     await take_action_db(new_game_id, "", result=new_game.scene, stats=f"{DEFAULT_STATS}", turn_number=1,
                           actions=json.dumps(new_game.actions))
 
+    print_turn(1, "", new_game.scene, actions)
+
     return new_game
 
 
@@ -450,6 +459,8 @@ async def take_action(game_id: str, action: TurnInput):
         stats_str = str(stats)
         await take_action_db(game_id=game_id, action="", result=result_text, turn_number=turn_number, stats=stats_str,
                               actions=json.dumps(actions))
+
+        print_turn(turn_number, action.action, result_text, actions)
 
         current_location = location_to_dict(await get_location(current_location_id))
         current_exits = filter_blocked_exits(await get_location_exits(current_location_id), blocked_locations)
@@ -546,6 +557,8 @@ async def take_action(game_id: str, action: TurnInput):
     # This turn's action is unknown until the player's next call updates it
     await take_action_db(game_id=game_id, action="", result=response["result"], turn_number=turn_number, stats=stats_str,
                           actions=json.dumps(actions))
+
+    print_turn(turn_number, action.action, response["result"], actions)
 
     achievements_earned = await check_achievements(game_id, {
         "combat_wins": await get_combat_wins(game_id),
