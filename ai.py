@@ -64,13 +64,23 @@ def location_prompt_block(location: dict | None, arriving: bool = False) -> str:
     return block
 
 
-async def start_game(game_input, location: dict | None = None) -> dict:
+def world_events_prompt_block(world_events: list | None) -> str:
+    if not world_events:
+        return ""
+    descriptions = "; ".join(f"{e['title']} - {e['description']}" for e in world_events)
+    return (f"Current world events affecting the setting: {descriptions}. Let this shape the world naturally"
+            f" - NPC dialogue, rumors, and the atmosphere should reflect it without needing to be told to.")
+
+
+async def start_game(game_input, location: dict | None = None, world_events: list | None = None) -> dict:
     """"Come up with unique game like D&D according to input data"""
 
     location_block = location_prompt_block(location)
+    events_block = world_events_prompt_block(world_events)
     prompt = f"""You are a dungeon master. Start a {game_input.setting}
                 adventure for a player named {game_input.player_name}. {location_block}
-                Write a 3-5 sentence opening scene grounded in this location.
+                {events_block}
+                Write a 3-5 sentence opening scene grounded in this location and, if applicable, the world events above.
                 Then provide exactly 3 possible actions as a JSON array.
                 Return ONLY valid JSON using double quotes for all keys and strings.
                 Do not use single quotes or Python dict syntax.
@@ -79,11 +89,14 @@ async def start_game(game_input, location: dict | None = None) -> dict:
     return result
 
 
-async def continue_game(game_history, stats, location: dict | None = None, arriving: bool = False) -> dict:
+async def continue_game(game_history, stats, location: dict | None = None, arriving: bool = False,
+                          world_events: list | None = None) -> dict:
     location_block = location_prompt_block(location, arriving=arriving)
+    events_block = world_events_prompt_block(world_events)
     prompt = f"""You are a dungeon master. Continue a game with such actions history and world building {game_history}.
                 Current character stats: {json.dumps(stats)}.
                 {location_block}
+                {events_block}
                 Write a 3-5 sentence continuation scene that reflects the outcome of the player's latest action.
                 Then provide exactly 3 possible actions as a JSON array.
                 If the latest action changes HP, gold, or inventory in any way (taking damage, defeating an

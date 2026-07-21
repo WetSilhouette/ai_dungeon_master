@@ -16,7 +16,7 @@ from db import (
     get_location, get_location_exits, get_location_state, update_location_state,
     increment_combat_wins, get_combat_wins, get_earned_achievements, award_achievement,
     mark_game_ended, is_game_ended, increment_gold_collected, get_gold_collected,
-    get_summary, save_summary
+    get_summary, save_summary, create_world_event, get_active_world_events
 )
 from contextlib import asynccontextmanager
 from ai import start_game, continue_game, narrate_combat, generate_summary
@@ -182,6 +182,24 @@ class ReplayResponse(BaseModel):
     turns: List[ReplayTurn] = Field(default_factory=list, description="All turns in chronological order")
 
 
+class WorldEventEffects(BaseModel):
+    shop_prices_multiplier: Optional[float] = Field(default=None, description="Multiplier applied to gold spent while active")
+    npc_mood: Optional[str] = Field(default=None, description="Flavor hint for NPC disposition during this event")
+    blocked_locations: List[str] = Field(default_factory=list, description="Location ids that cannot be entered while active")
+
+
+class WorldEventInput(BaseModel):
+    title: str = Field(..., description="Short title of the event")
+    description: str = Field(..., description="Description injected into every LLM call while the event is active")
+    effects: WorldEventEffects = Field(default_factory=WorldEventEffects, description="Mechanical effects of the event")
+    starts_at: str = Field(..., description="Date the event becomes active, e.g. 2026-07-01")
+    ends_at: str = Field(..., description="Date the event stops being active, e.g. 2026-07-07")
+
+
+class WorldEventResponse(WorldEventInput):
+    event_id: str = Field(..., description="Unique identifier of the event")
+
+
 def apply_stat_updates(stats: dict, updates: dict) -> dict:
     for key in ("hp", "attack", "defence", "gold"):
         delta = updates.get(key)
@@ -225,6 +243,42 @@ def ensure_move_action(actions: List[str], exits: list) -> List[str]:
 
 def location_to_dict(location_row) -> dict:
     return {"id": location_row[0], "name": location_row[1], "description": location_row[2], "atmosphere": location_row[3]}
+
+
+def parse_world_event(row) -> dict:
+    return {
+        "event_id": row[0],
+        "title": row[1],
+        "description": row[2],
+        "effects": json.loads(row[3]) if row[3] else {},
+        "starts_at": row[4],
+        "ends_at": row[5],
+    }
+
+
+async def get_active_events() -> List[dict]:
+    """Every world event active right now, global across all games - not scoped to a single game_id."""
+    return [parse_world_event(row) for row in await get_active_world_events()]
+
+
+def get_blocked_locations(events: List[dict]) -> set:
+    blocked = set()
+    for event in events:
+        blocked.update(event["effects"].get("blocked_locations") or [])
+    return blocked
+
+
+def get_shop_price_multiplier(events: List[dict]) -> float:
+    multiplier = 1.0
+    for event in events:
+        m = event["effects"].get("shop_prices_multiplier")
+        if isinstance(m, (int, float)):
+            multiplier *= m
+    return multiplier
+
+
+def filter_blocked_exits(exits: list, blocked_locations: set) -> list:
+    return [(exit_id, name) for exit_id, name in exits if exit_id not in blocked_locations]
 
 
 async def check_achievements(game_id: str, ctx: dict) -> List[str]:
@@ -312,9 +366,10 @@ async def create_game(game: GameInput):
     )
 
     location = location_to_dict(await get_location(STARTING_LOCATION_ID))
-    exits = await get_location_exits(STARTING_LOCATION_ID)
+    active_events = await get_active_events()
+    exits = filter_blocked_exits(await get_location_exits(STARTING_LOCATION_ID), get_blocked_locations(active_events))
 
-    game_output = await start_game(game_inputs, location=location)
+    game_output = await start_game(game_inputs, location=location, world_events=active_events)
     actions = ensure_move_action(game_output["actions"], exits)
     await save_game(new_game_id, game_inputs)
 
@@ -361,6 +416,9 @@ async def take_action(game_id: str, action: TurnInput):
     }
     current_location_id = location_state["current_location"]
 
+    active_events = await get_active_events()
+    blocked_locations = get_blocked_locations(active_events)
+
     turn_number = previous_turn_number + 1
 
     if combat_state.get("in_combat"):
@@ -394,7 +452,7 @@ async def take_action(game_id: str, action: TurnInput):
                               actions=json.dumps(actions))
 
         current_location = location_to_dict(await get_location(current_location_id))
-        current_exits = await get_location_exits(current_location_id)
+        current_exits = filter_blocked_exits(await get_location_exits(current_location_id), blocked_locations)
 
         achievements_earned = await check_achievements(game_id, {
             "combat_wins": await get_combat_wins(game_id),
@@ -429,21 +487,35 @@ async def take_action(game_id: str, action: TurnInput):
     move_target = match_move_action(action.action, exits_before_move)
     arriving = move_target is not None
     if arriving:
+        if move_target["id"] in blocked_locations:
+            blocking_event = next(
+                e for e in active_events if move_target["id"] in (e["effects"].get("blocked_locations") or [])
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"The way to {move_target['name']} is cut off: {blocking_event['title']} - {blocking_event['description']}"
+            )
         current_location_id = move_target["id"]
         location_state["current_location"] = current_location_id
         if current_location_id not in location_state["visited_locations"]:
             location_state["visited_locations"].append(current_location_id)
 
     current_location = location_to_dict(await get_location(current_location_id))
-    current_exits = await get_location_exits(current_location_id)
+    current_exits = filter_blocked_exits(await get_location_exits(current_location_id), blocked_locations)
 
-    response = await continue_game(game_history, stats=stats, location=current_location, arriving=arriving)
+    response = await continue_game(game_history, stats=stats, location=current_location, arriving=arriving,
+                                     world_events=active_events)
 
     updates = response.get("updates")
     if isinstance(updates, dict):
         gold_delta = updates.get("gold")
-        if isinstance(gold_delta, (int, float)) and gold_delta > 0:
-            await increment_gold_collected(game_id, int(gold_delta))
+        if isinstance(gold_delta, (int, float)):
+            if gold_delta > 0:
+                await increment_gold_collected(game_id, int(gold_delta))
+            elif gold_delta < 0:
+                multiplier = get_shop_price_multiplier(active_events)
+                if multiplier != 1.0:
+                    updates["gold"] = gold_delta * multiplier
         stats = apply_stat_updates(stats, updates)
     game_over = stats["hp"] <= 0 or turn_number >= MAX_TURNS
     stats_str = str(stats)
@@ -635,3 +707,17 @@ async def get_replay(game_id: str):
     history = list(reversed(await get_game_history(game_id)))
     turns = [ReplayTurn(turn=row[2], action=row[3], result=row[4]) for row in history]
     return ReplayResponse(game_id=game_id, turns=turns)
+
+
+@app.post("/admin/events", response_model=WorldEventResponse)
+async def create_event(event: WorldEventInput):
+    event_id = "evt_" + "".join(random.choice(string.digits) for _ in range(6))
+    await create_world_event(
+        event_id=event_id,
+        title=event.title,
+        description=event.description,
+        effects_json=json.dumps(event.effects.model_dump()),
+        starts_at=event.starts_at,
+        ends_at=event.ends_at
+    )
+    return WorldEventResponse(event_id=event_id, **event.model_dump())

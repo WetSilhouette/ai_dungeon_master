@@ -92,6 +92,15 @@ async def init_db() -> None:
             FOREIGN KEY (game_id) REFERENCES games (game_id)
             )""")
         await db.commit()
+        await db.execute("""CREATE TABLE IF NOT EXISTS world_events (
+            event_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            effects TEXT DEFAULT '{}',
+            starts_at TEXT NOT NULL,
+            ends_at TEXT NOT NULL
+            )""")
+        await db.commit()
 
         for location in DEFAULT_LOCATIONS:
             await db.execute(
@@ -372,6 +381,30 @@ async def save_summary(game_id: str, title: str, summary_text: str) -> None:
             (title, summary_text, game_id)
         )
         await db.commit()
+
+
+# Create a new global world event
+async def create_world_event(event_id: str, title: str, description: str, effects_json: str,
+                               starts_at: str, ends_at: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO world_events (event_id, title, description, effects, starts_at, ends_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, title, description, effects_json, starts_at, ends_at)
+            )
+        await db.commit()
+
+
+# Get every world event currently active, by date - not scoped to any single game
+async def get_active_world_events():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT event_id, title, description, effects, starts_at, ends_at
+            FROM world_events
+            WHERE date(starts_at) <= date('now') AND date(ends_at) >= date('now')
+        """)
+        return await cursor.fetchall()
 
 
 
