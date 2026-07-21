@@ -1,13 +1,18 @@
 import asyncio
 import json
+import sqlite3
+from datetime import datetime
 from enum import Enum
 from typing import List, Optional
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import string
 import random
 import ast
-from db import init_db, save_game, take_action_db, get_game_history, get_last_turn, update_action, get_combat_state, update_combat_state
+from db import (
+    init_db, save_game, take_action_db, get_game_history, get_last_turn, update_action,
+    get_combat_state, update_combat_state, get_game, create_save, get_save
+)
 from contextlib import asynccontextmanager
 from ai import start_game, continue_game, narrate_combat
 
@@ -30,6 +35,21 @@ DEFAULT_STATS = {
 
 COMBAT_TRIGGER_WORDS = ["attacks you", "enemy appears", "monster", "lunges at you", "charges at you", "ambush"]
 DEFAULT_ENEMY = {"name": "Enemy", "hp": 30, "attack": 8}
+
+SAVE_ADJECTIVES = [
+    "brave", "swift", "dark", "golden", "silent", "wild", "fierce", "ancient", "shadow", "crimson",
+    "silver", "iron", "stormy", "frozen", "burning", "noble", "cursed", "lucky", "grim", "wandering",
+    "hidden", "lonely", "restless", "savage", "sly", "bold", "quiet", "roaring", "wise", "reckless",
+    "mystic", "sunken", "broken", "radiant", "twilight", "howling", "rusty", "gleaming", "sturdy", "feral",
+    "clever", "weary", "vengeful", "loyal", "fabled", "phantom", "gilded", "rugged", "spectral", "valiant",
+    "cunning", "somber", "electric", "frosty", "molten", "obsidian", "verdant", "azure", "scarlet", "ashen",
+]
+
+
+def generate_save_code() -> str:
+    adjective = random.choice(SAVE_ADJECTIVES).upper()
+    digits = random.randint(1000, 9999)
+    return f"{adjective}-{digits}"
 
 
 class GameSetting(Enum):
@@ -83,6 +103,23 @@ class Turn(BaseModel):
 
 class TurnInput(BaseModel):
     action:str = Field(..., description="Your actions (choose one from the list e.g. 1, 2 or 3)")
+
+
+class SaveResponse(BaseModel):
+    save_code: str = Field(..., description="Memorable code to reload this game later")
+
+
+class LoadInput(BaseModel):
+    save_code: str = Field(..., description="Save code returned by the save endpoint")
+
+
+class LoadedGame(BaseModel):
+    game_id: str = Field(..., description="Unique identifier of the Game")
+    scene: str = Field(..., description="The last narrated scene")
+    actions: List[str] = Field(..., description="Actions available from this point")
+    stats: Stats = Field(..., description="Character stats at the point of saving")
+    turn: int = Field(..., description="Turn count reached")
+    combat: CombatInfo = Field(default_factory=CombatInfo, description="Combat encounter in progress, if any")
 
 
 def apply_stat_updates(stats: dict, updates: dict) -> dict:
@@ -175,7 +212,8 @@ async def create_game(game: GameInput):
     )
 
     # Create character in "turns" table in database - no action has been taken yet
-    await take_action_db(new_game_id, "", result=new_game.scene, stats=f"{DEFAULT_STATS}", turn_number=1)
+    await take_action_db(new_game_id, "", result=new_game.scene, stats=f"{DEFAULT_STATS}", turn_number=1,
+                          actions=json.dumps(new_game.actions))
 
     return new_game
 
@@ -190,7 +228,7 @@ async def take_action(game_id: str, action: TurnInput):
     await update_action(game_id=game_id, action=action.action, turn_number=previous_turn_number)
 
     stats_row = await get_last_turn(game_id)
-    stats = ast.literal_eval(stats_row[-1])
+    stats = ast.literal_eval(stats_row[5])
 
     combat_row = await get_combat_state(game_id)
     combat_state = json.loads(combat_row[0]) if combat_row and combat_row[0] else {"in_combat": False}
@@ -223,7 +261,8 @@ async def take_action(game_id: str, action: TurnInput):
 
         game_over = stats["hp"] <= 0
         stats_str = str(stats)
-        await take_action_db(game_id=game_id, action="", result=result_text, turn_number=turn_number, stats=stats_str)
+        await take_action_db(game_id=game_id, action="", result=result_text, turn_number=turn_number, stats=stats_str,
+                              actions=json.dumps(actions))
 
         return Turn(
             result=result_text,
@@ -271,7 +310,8 @@ async def take_action(game_id: str, action: TurnInput):
     await update_combat_state(game_id, json.dumps(combat_state))
 
     # This turn's action is unknown until the player's next call updates it
-    await take_action_db(game_id=game_id, action="", result=response["result"], turn_number=turn_number, stats=stats_str)
+    await take_action_db(game_id=game_id, action="", result=response["result"], turn_number=turn_number, stats=stats_str,
+                          actions=json.dumps(actions))
 
     turn = Turn(
         result=response["result"],
@@ -286,3 +326,49 @@ async def take_action(game_id: str, action: TurnInput):
         )
     )
     return turn
+
+
+@app.post("/games/{game_id}/save", response_model=SaveResponse)
+async def save_game_endpoint(game_id: str):
+    if await get_game(game_id) is None:
+        raise HTTPException(status_code=404, detail="No game found with that id")
+
+    saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for _ in range(5):
+        save_code = generate_save_code()
+        try:
+            await create_save(game_id, save_code, saved_at)
+            return SaveResponse(save_code=save_code)
+        except sqlite3.IntegrityError:
+            continue
+
+    raise HTTPException(status_code=500, detail="Could not generate a unique save code, please try again")
+
+
+@app.post("/games/load", response_model=LoadedGame)
+async def load_game(load_input: LoadInput):
+    save_row = await get_save(load_input.save_code)
+    if save_row is None:
+        raise HTTPException(status_code=404, detail="No game found with that code")
+
+    game_id = save_row[0]
+    turn_row = await get_last_turn(game_id)
+    stats = ast.literal_eval(turn_row[5])
+    actions = json.loads(turn_row[6])
+
+    combat_row = await get_combat_state(game_id)
+    combat_state = json.loads(combat_row[0]) if combat_row and combat_row[0] else {"in_combat": False}
+    enemy = combat_state.get("enemy")
+
+    return LoadedGame(
+        game_id=game_id,
+        scene=turn_row[4],
+        actions=actions,
+        stats=Stats(**stats),
+        turn=turn_row[2],
+        combat=CombatInfo(
+            in_combat=combat_state.get("in_combat", False),
+            enemy_name=enemy["name"] if enemy else None,
+            enemy_hp=enemy["hp"] if enemy else None
+        )
+    )

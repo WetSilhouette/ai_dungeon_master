@@ -28,6 +28,14 @@ async def init_db() -> None:
             action TEXT NOT NULL,
             result TEXT NOT NULL,
             stats TEXT DEFAULT '{...}',
+            actions TEXT DEFAULT '[]',
+            FOREIGN KEY (game_id) REFERENCES games (game_id)
+            )""")
+        await db.commit()
+        await db.execute("""CREATE TABLE IF NOT EXISTS saves (
+            save_code TEXT PRIMARY KEY,
+            game_id TEXT NOT NULL,
+            saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (game_id) REFERENCES games (game_id)
             )""")
         await db.commit()
@@ -76,14 +84,14 @@ async def get_game_history(game_id: str):
 
 
 # Add character's turn to the 'turns' table
-async def take_action_db(game_id: str, action: str, result: str, turn_number: int, stats: str) -> int:
+async def take_action_db(game_id: str, action: str, result: str, turn_number: int, stats: str, actions: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
 
         cursor = await db.execute("""
-            INSERT INTO turns (game_id, turn_number, action, result, stats)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO turns (game_id, turn_number, action, result, stats, actions)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (game_id, turn_number, action, result, stats)
+            (game_id, turn_number, action, result, stats, actions)
             )
         await db.commit()
         return cursor.lastrowid
@@ -126,6 +134,41 @@ async def get_combat_state(game_id: str):
             WHERE game_id = ?
         """, (game_id,))
         await db.commit()
+        return await cursor.fetchone()
+
+
+# Check whether a game exists
+async def get_game(game_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT game_id, player_name, setting
+            FROM games
+            WHERE game_id = ?
+        """, (game_id,))
+        return await cursor.fetchone()
+
+
+# Create a save code for a game, replacing any existing save for that game
+async def create_save(game_id: str, save_code: str, saved_at: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM saves WHERE game_id = ?", (game_id,))
+        await db.execute("""
+            INSERT INTO saves (save_code, game_id, saved_at)
+            VALUES (?, ?, ?)
+            """,
+            (save_code, game_id, saved_at)
+            )
+        await db.commit()
+
+
+# Look up the game_id for a save code
+async def get_save(save_code: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT game_id
+            FROM saves
+            WHERE save_code = ?
+        """, (save_code,))
         return await cursor.fetchone()
 
 
