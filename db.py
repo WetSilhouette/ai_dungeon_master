@@ -44,6 +44,7 @@ async def init_db() -> None:
             setting TEXT NOT NULL,
             combat_state TEXT DEFAULT NULL,
             location_state TEXT DEFAULT NULL,
+            combat_wins INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)
         """)
         await db.commit()
@@ -77,6 +78,14 @@ async def init_db() -> None:
             PRIMARY KEY (from_location, to_location),
             FOREIGN KEY (from_location) REFERENCES locations (id),
             FOREIGN KEY (to_location) REFERENCES locations (id)
+            )""")
+        await db.commit()
+        await db.execute("""CREATE TABLE IF NOT EXISTS achievements (
+            game_id TEXT NOT NULL,
+            achievement_id TEXT NOT NULL,
+            earned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (game_id, achievement_id),
+            FOREIGN KEY (game_id) REFERENCES games (game_id)
             )""")
         await db.commit()
 
@@ -270,6 +279,45 @@ async def update_location_state(game_id: str, location_state_json: str) -> int:
             )
         await db.commit()
         return cursor.lastrowid
+
+
+# Increment a game's total combat victories
+async def increment_combat_wins(game_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            UPDATE games
+            SET combat_wins = combat_wins + 1
+            WHERE game_id = ?
+            """,
+            (game_id,)
+            )
+        await db.commit()
+        return cursor.lastrowid
+
+
+# Get a game's total combat victories
+async def get_combat_wins(game_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT combat_wins FROM games WHERE game_id = ?", (game_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+# Get the achievement ids already earned for a game
+async def get_earned_achievements(game_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT achievement_id FROM achievements WHERE game_id = ?", (game_id,))
+        return await cursor.fetchall()
+
+
+# Award an achievement, ignoring if it was already earned
+async def award_achievement(game_id: str, achievement_id: str, earned_at: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO achievements (game_id, achievement_id, earned_at) VALUES (?, ?, ?)",
+            (game_id, achievement_id, earned_at)
+        )
+        await db.commit()
 
 
 

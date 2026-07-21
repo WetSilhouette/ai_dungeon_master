@@ -226,6 +226,33 @@
   }
   #location-text { font-weight: bold; }
   #visited-text { color: var(--muted); font-size: 0.85em; margin-top: 4px; }
+  #achievements-text { color: var(--muted); }
+
+  .toast-container {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 1000;
+  }
+  .toast {
+    background: #33291a;
+    border: 1px solid #b8933f;
+    color: #ffd98e;
+    padding: 10px 18px;
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    font-size: 0.9em;
+    opacity: 0;
+    transform: translateX(20px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(0);
+  }
 </style>
 </head>
 <body>
@@ -287,8 +314,13 @@
       <h3>Location</h3>
       <div id="location-text"></div>
       <div id="visited-text"></div>
+
+      <h3>Achievements</h3>
+      <div id="achievements-text">0/5</div>
     </div>
   </div>
+
+  <div id="toast-container" class="toast-container"></div>
 
 <script>
   const state = { gameId: null, gameOver: false };
@@ -365,6 +397,30 @@
     el('visited-text').textContent = `Visited: ${visited.length} location(s)`;
   }
 
+  function showAchievementToast(name) {
+    const container = el('toast-container');
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.textContent = `🏆 Achievement unlocked: ${name}`;
+    container.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add('show'));
+    setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 300);
+    }, 4000);
+  }
+
+  async function refreshAchievements() {
+    try {
+      const res = await fetch(`/games/${state.gameId}/achievements`);
+      if (!res.ok) return;
+      const data = await res.json();
+      el('achievements-text').textContent = `${data.achievements.length}/5`;
+    } catch (e) {
+      // non-critical - leave the counter as-is
+    }
+  }
+
   function renderActions(actions) {
     const container = el('action-buttons');
     container.innerHTML = '';
@@ -420,6 +476,10 @@
       } else {
         renderActions(turn.actions);
       }
+      if (turn.achievements_earned && turn.achievements_earned.length) {
+        turn.achievements_earned.forEach(showAchievementToast);
+        refreshAchievements();
+      }
     } catch (e) {
       el('action-error').textContent = e.message;
     } finally {
@@ -444,6 +504,7 @@
     renderCombat(game.combat || { in_combat: false });
     renderLocation(game.location);
     renderActions(game.actions);
+    refreshAchievements();
   }
 
   el('start-btn').addEventListener('click', async () => {

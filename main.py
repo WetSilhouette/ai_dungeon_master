@@ -13,7 +13,8 @@ import ast
 from db import (
     init_db, save_game, take_action_db, get_game_history, get_last_turn, update_action,
     get_combat_state, update_combat_state, get_game, create_save, get_save,
-    get_location, get_location_exits, get_location_state, update_location_state
+    get_location, get_location_exits, get_location_state, update_location_state,
+    increment_combat_wins, get_combat_wins, get_earned_achievements, award_achievement
 )
 from contextlib import asynccontextmanager
 from ai import start_game, continue_game, narrate_combat
@@ -39,6 +40,14 @@ COMBAT_TRIGGER_WORDS = ["attacks you", "enemy appears", "monster", "lunges at yo
 DEFAULT_ENEMY = {"name": "Enemy", "hp": 30, "attack": 8}
 
 STARTING_LOCATION_ID = "tavern"
+
+ACHIEVEMENTS = [
+    {"id": "first_blood", "name": "First Blood", "check": lambda ctx: ctx["combat_wins"] >= 1},
+    {"id": "millionaire", "name": "Millionaire", "check": lambda ctx: ctx["stats"].get("gold", 0) >= 1000},
+    {"id": "explorer", "name": "Explorer", "check": lambda ctx: len(ctx["visited_locations"]) >= 5},
+    {"id": "survivor", "name": "Survivor", "check": lambda ctx: ctx["turn"] >= 25},
+    {"id": "hoarder", "name": "Hoarder", "check": lambda ctx: len(ctx["stats"].get("inventory", [])) >= 10},
+]
 
 SAVE_ADJECTIVES = [
     "brave", "swift", "dark", "golden", "silent", "wild", "fierce", "ancient", "shadow", "crimson",
@@ -111,6 +120,11 @@ class Turn(BaseModel):
     game_over: bool = Field(default=False, description="True once the character's HP has reached 0")
     combat: CombatInfo = Field(default_factory=CombatInfo, description="Current combat encounter, if any")
     location: LocationInfo = Field(default_factory=LocationInfo, description="Current location, if any")
+    achievements_earned: List[str] = Field(default_factory=list, description="Achievements newly earned this turn")
+
+
+class AchievementsResponse(BaseModel):
+    achievements: List[str] = Field(default_factory=list, description="Names of achievements earned so far")
 
 
 class TurnInput(BaseModel):
@@ -178,6 +192,20 @@ def ensure_move_action(actions: List[str], exits: list) -> List[str]:
 
 def location_to_dict(location_row) -> dict:
     return {"id": location_row[0], "name": location_row[1], "description": location_row[2], "atmosphere": location_row[3]}
+
+
+async def check_achievements(game_id: str, ctx: dict) -> List[str]:
+    """Award any achievements newly satisfied by the current game state. Each is awarded once per game."""
+    earned_ids = {row[0] for row in await get_earned_achievements(game_id)}
+    earned_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    newly_earned = []
+    for achievement in ACHIEVEMENTS:
+        if achievement["id"] in earned_ids:
+            continue
+        if achievement["check"](ctx):
+            await award_achievement(game_id, achievement["id"], earned_at)
+            newly_earned.append(achievement["name"])
+    return newly_earned
 
 
 def detect_combat_trigger(text: str) -> bool:
@@ -303,6 +331,7 @@ async def take_action(game_id: str, action: TurnInput):
 
         if outcome == "victory":
             combat_state = {"in_combat": False}
+            await increment_combat_wins(game_id)
             actions = ["Search the fallen enemy for loot", "Catch your breath and take stock of your surroundings", "Press onward"]
         elif outcome == "fled":
             combat_state = {"in_combat": False}
@@ -324,6 +353,13 @@ async def take_action(game_id: str, action: TurnInput):
         current_location = location_to_dict(await get_location(current_location_id))
         current_exits = await get_location_exits(current_location_id)
 
+        achievements_earned = await check_achievements(game_id, {
+            "combat_wins": await get_combat_wins(game_id),
+            "stats": stats,
+            "visited_locations": location_state["visited_locations"],
+            "turn": turn_number
+        })
+
         return Turn(
             result=result_text,
             actions=actions,
@@ -339,7 +375,8 @@ async def take_action(game_id: str, action: TurnInput):
                 current_location=current_location["name"],
                 visited_locations=location_state["visited_locations"],
                 available_exits=[name for _, name in current_exits]
-            )
+            ),
+            achievements_earned=achievements_earned
         )
 
     # Not in combat - normal story flow. Re-fetch history so the LLM sees the action just recorded above
@@ -392,6 +429,13 @@ async def take_action(game_id: str, action: TurnInput):
     await take_action_db(game_id=game_id, action="", result=response["result"], turn_number=turn_number, stats=stats_str,
                           actions=json.dumps(actions))
 
+    achievements_earned = await check_achievements(game_id, {
+        "combat_wins": await get_combat_wins(game_id),
+        "stats": stats,
+        "visited_locations": location_state["visited_locations"],
+        "turn": turn_number
+    })
+
     turn = Turn(
         result=response["result"],
         actions=actions,
@@ -407,7 +451,8 @@ async def take_action(game_id: str, action: TurnInput):
             current_location=current_location["name"],
             visited_locations=location_state["visited_locations"],
             available_exits=[name for _, name in current_exits]
-        )
+        ),
+        achievements_earned=achievements_earned
     )
     return turn
 
@@ -468,3 +513,13 @@ async def load_game(load_input: LoadInput):
             available_exits=[name for _, name in exits]
         )
     )
+
+
+@app.get("/games/{game_id}/achievements", response_model=AchievementsResponse)
+async def get_achievements(game_id: str):
+    if await get_game(game_id) is None:
+        raise HTTPException(status_code=404, detail="No game found with that id")
+
+    earned_ids = {row[0] for row in await get_earned_achievements(game_id)}
+    names = [a["name"] for a in ACHIEVEMENTS if a["id"] in earned_ids]
+    return AchievementsResponse(achievements=names)
