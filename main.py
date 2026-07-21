@@ -5,6 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import string
 import random
@@ -227,7 +228,7 @@ def resolve_combat_round(action_text: str, stats: dict, enemy: dict) -> dict:
 
 @app.get("/")
 async def main_page():
-    return "Hello World"
+    return FileResponse("static/index.html")
 
 
 @app.post("/games", response_model=Game)
