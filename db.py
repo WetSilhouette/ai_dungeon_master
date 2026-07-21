@@ -8,6 +8,31 @@ from pydantic import with_config
 
 DB_PATH = "games.db"
 
+DEFAULT_LOCATIONS = [
+    {"id": "tavern", "name": "The Rusty Tankard Tavern",
+     "description": "A smoky, low-ceilinged tavern full of hushed conversation and the smell of stale ale.",
+     "atmosphere": "warm, crowded, and gossip-filled"},
+    {"id": "town_square", "name": "Town Square",
+     "description": "The heart of town, ringed by market stalls and a cracked stone fountain.",
+     "atmosphere": "bustling and loud by day, eerily quiet at night"},
+    {"id": "dark_forest", "name": "Dark Forest",
+     "description": "A dense, ancient forest where the canopy blots out most of the daylight.",
+     "atmosphere": "cold, damp, and watchful"},
+    {"id": "ancient_ruins", "name": "Ancient Ruins",
+     "description": "Crumbling stone structures overtaken by moss, remnants of a civilization long gone.",
+     "atmosphere": "silent, reverent, and unsettling"},
+    {"id": "deep_dungeon", "name": "Deep Dungeon",
+     "description": "A labyrinth of torch-lit corridors carved deep beneath the earth.",
+     "atmosphere": "oppressive, dank, and dangerous"},
+]
+
+DEFAULT_EXITS = [
+    ("tavern", "town_square"), ("town_square", "tavern"),
+    ("town_square", "dark_forest"), ("dark_forest", "town_square"),
+    ("town_square", "ancient_ruins"), ("ancient_ruins", "town_square"),
+    ("dark_forest", "deep_dungeon"), ("deep_dungeon", "dark_forest"),
+]
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -18,6 +43,7 @@ async def init_db() -> None:
             player_name TEXT NOT NULL,
             setting TEXT NOT NULL,
             combat_state TEXT DEFAULT NULL,
+            location_state TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)
         """)
         await db.commit()
@@ -38,6 +64,32 @@ async def init_db() -> None:
             saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (game_id) REFERENCES games (game_id)
             )""")
+        await db.commit()
+        await db.execute("""CREATE TABLE IF NOT EXISTS locations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            atmosphere TEXT NOT NULL
+            )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS location_exits (
+            from_location TEXT NOT NULL,
+            to_location TEXT NOT NULL,
+            PRIMARY KEY (from_location, to_location),
+            FOREIGN KEY (from_location) REFERENCES locations (id),
+            FOREIGN KEY (to_location) REFERENCES locations (id)
+            )""")
+        await db.commit()
+
+        for location in DEFAULT_LOCATIONS:
+            await db.execute(
+                "INSERT OR IGNORE INTO locations (id, name, description, atmosphere) VALUES (?, ?, ?, ?)",
+                (location["id"], location["name"], location["description"], location["atmosphere"])
+            )
+        for from_id, to_id in DEFAULT_EXITS:
+            await db.execute(
+                "INSERT OR IGNORE INTO location_exits (from_location, to_location) VALUES (?, ?)",
+                (from_id, to_id)
+            )
         await db.commit()
 
 
@@ -170,6 +222,54 @@ async def get_save(save_code: str):
             WHERE save_code = ?
         """, (save_code,))
         return await cursor.fetchone()
+
+
+# Get one location's details
+async def get_location(location_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT id, name, description, atmosphere
+            FROM locations
+            WHERE id = ?
+        """, (location_id,))
+        return await cursor.fetchone()
+
+
+# Get the locations reachable from a given location, as (id, name) pairs
+async def get_location_exits(location_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT l.id, l.name
+            FROM location_exits e
+            JOIN locations l ON l.id = e.to_location
+            WHERE e.from_location = ?
+        """, (location_id,))
+        return await cursor.fetchall()
+
+
+# Get a game's location state
+async def get_location_state(game_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT location_state
+            FROM games
+            WHERE game_id = ?
+        """, (game_id,))
+        return await cursor.fetchone()
+
+
+# Update a game's location state
+async def update_location_state(game_id: str, location_state_json: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            UPDATE games
+            SET location_state = ?
+            WHERE game_id = ?
+            """,
+            (location_state_json, game_id)
+            )
+        await db.commit()
+        return cursor.lastrowid
 
 
 

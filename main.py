@@ -11,7 +11,8 @@ import random
 import ast
 from db import (
     init_db, save_game, take_action_db, get_game_history, get_last_turn, update_action,
-    get_combat_state, update_combat_state, get_game, create_save, get_save
+    get_combat_state, update_combat_state, get_game, create_save, get_save,
+    get_location, get_location_exits, get_location_state, update_location_state
 )
 from contextlib import asynccontextmanager
 from ai import start_game, continue_game, narrate_combat
@@ -35,6 +36,8 @@ DEFAULT_STATS = {
 
 COMBAT_TRIGGER_WORDS = ["attacks you", "enemy appears", "monster", "lunges at you", "charges at you", "ambush"]
 DEFAULT_ENEMY = {"name": "Enemy", "hp": 30, "attack": 8}
+
+STARTING_LOCATION_ID = "tavern"
 
 SAVE_ADJECTIVES = [
     "brave", "swift", "dark", "golden", "silent", "wild", "fierce", "ancient", "shadow", "crimson",
@@ -81,9 +84,16 @@ class GameCreate(GameBase):
     pass
 
 
+class LocationInfo(BaseModel):
+    current_location: Optional[str] = Field(default=None, description="Name of the current location")
+    visited_locations: List[str] = Field(default_factory=list, description="Locations visited so far")
+    available_exits: List[str] = Field(default_factory=list, description="Names of locations reachable from here")
+
+
 class Game(GameBase):
     game_id: str = Field(..., description="Unique identifier of the Game")
     stats: Stats = Field(..., description="Character stats at the start of the game")
+    location: LocationInfo = Field(default_factory=LocationInfo, description="Starting location")
 
 
 class CombatInfo(BaseModel):
@@ -99,6 +109,7 @@ class Turn(BaseModel):
     stats: Stats = Field(..., description="Character stats after this turn")
     game_over: bool = Field(default=False, description="True once the character's HP has reached 0")
     combat: CombatInfo = Field(default_factory=CombatInfo, description="Current combat encounter, if any")
+    location: LocationInfo = Field(default_factory=LocationInfo, description="Current location, if any")
 
 
 class TurnInput(BaseModel):
@@ -120,6 +131,7 @@ class LoadedGame(BaseModel):
     stats: Stats = Field(..., description="Character stats at the point of saving")
     turn: int = Field(..., description="Turn count reached")
     combat: CombatInfo = Field(default_factory=CombatInfo, description="Combat encounter in progress, if any")
+    location: LocationInfo = Field(default_factory=LocationInfo, description="Location at the point of saving")
 
 
 def apply_stat_updates(stats: dict, updates: dict) -> dict:
@@ -139,6 +151,32 @@ def apply_stat_updates(stats: dict, updates: dict) -> dict:
     stats["hp"] = max(0, min(stats["hp"], stats["max_hp"]))
     stats["gold"] = max(0, stats["gold"])
     return stats
+
+
+def match_move_action(action_text: str, exits: list) -> Optional[dict]:
+    """Check if the submitted action names one of the current location's exits."""
+    lowered = action_text.lower()
+    for exit_id, exit_name in exits:
+        if exit_name.lower() in lowered:
+            return {"id": exit_id, "name": exit_name}
+    return None
+
+
+def ensure_move_action(actions: List[str], exits: list) -> List[str]:
+    """Guarantee one of the offered actions is a move option whenever exits exist."""
+    if not exits:
+        return actions
+    exit_names_lower = [name.lower() for _, name in exits]
+    if any(exit_name in a.lower() for a in actions for exit_name in exit_names_lower):
+        return actions
+    _, chosen_name = random.choice(exits)
+    updated = list(actions)
+    updated[-1] = f"Move to {chosen_name}"
+    return updated
+
+
+def location_to_dict(location_row) -> dict:
+    return {"id": location_row[0], "name": location_row[1], "description": location_row[2], "atmosphere": location_row[3]}
 
 
 def detect_combat_trigger(text: str) -> bool:
@@ -201,14 +239,26 @@ async def create_game(game: GameInput):
         setting=game.setting
     )
 
-    game_output = await start_game(game_inputs)
+    location = location_to_dict(await get_location(STARTING_LOCATION_ID))
+    exits = await get_location_exits(STARTING_LOCATION_ID)
+
+    game_output = await start_game(game_inputs, location=location)
+    actions = ensure_move_action(game_output["actions"], exits)
     await save_game(new_game_id, game_inputs)
+
+    location_state = {"current_location": STARTING_LOCATION_ID, "visited_locations": [STARTING_LOCATION_ID]}
+    await update_location_state(new_game_id, json.dumps(location_state))
 
     new_game = Game(
         game_id=new_game_id,
         scene=game_output["scene"],
-        actions=game_output["actions"],
-        stats=Stats(**DEFAULT_STATS)
+        actions=actions,
+        stats=Stats(**DEFAULT_STATS),
+        location=LocationInfo(
+            current_location=location["name"],
+            visited_locations=location_state["visited_locations"],
+            available_exits=[name for _, name in exits]
+        )
     )
 
     # Create character in "turns" table in database - no action has been taken yet
@@ -232,6 +282,12 @@ async def take_action(game_id: str, action: TurnInput):
 
     combat_row = await get_combat_state(game_id)
     combat_state = json.loads(combat_row[0]) if combat_row and combat_row[0] else {"in_combat": False}
+
+    location_row = await get_location_state(game_id)
+    location_state = json.loads(location_row[0]) if location_row and location_row[0] else {
+        "current_location": STARTING_LOCATION_ID, "visited_locations": [STARTING_LOCATION_ID]
+    }
+    current_location_id = location_state["current_location"]
 
     turn_number = previous_turn_number + 1
 
@@ -264,6 +320,9 @@ async def take_action(game_id: str, action: TurnInput):
         await take_action_db(game_id=game_id, action="", result=result_text, turn_number=turn_number, stats=stats_str,
                               actions=json.dumps(actions))
 
+        current_location = location_to_dict(await get_location(current_location_id))
+        current_exits = await get_location_exits(current_location_id)
+
         return Turn(
             result=result_text,
             actions=actions,
@@ -274,12 +333,30 @@ async def take_action(game_id: str, action: TurnInput):
                 in_combat=combat_state["in_combat"],
                 enemy_name=enemy["name"] if combat_state["in_combat"] else None,
                 enemy_hp=enemy["hp"] if combat_state["in_combat"] else None
+            ),
+            location=LocationInfo(
+                current_location=current_location["name"],
+                visited_locations=location_state["visited_locations"],
+                available_exits=[name for _, name in current_exits]
             )
         )
 
     # Not in combat - normal story flow. Re-fetch history so the LLM sees the action just recorded above
     game_history = await get_game_history(game_id)
-    response = await continue_game(game_history, stats=stats)
+
+    exits_before_move = await get_location_exits(current_location_id)
+    move_target = match_move_action(action.action, exits_before_move)
+    arriving = move_target is not None
+    if arriving:
+        current_location_id = move_target["id"]
+        location_state["current_location"] = current_location_id
+        if current_location_id not in location_state["visited_locations"]:
+            location_state["visited_locations"].append(current_location_id)
+
+    current_location = location_to_dict(await get_location(current_location_id))
+    current_exits = await get_location_exits(current_location_id)
+
+    response = await continue_game(game_history, stats=stats, location=current_location, arriving=arriving)
 
     updates = response.get("updates")
     if isinstance(updates, dict):
@@ -305,9 +382,10 @@ async def take_action(game_id: str, action: TurnInput):
         actions = ["Attack", "Defend", "Flee"]
     else:
         combat_state = {"in_combat": False}
-        actions = [] if game_over else response["actions"]
+        actions = [] if game_over else ensure_move_action(response["actions"], current_exits)
 
     await update_combat_state(game_id, json.dumps(combat_state))
+    await update_location_state(game_id, json.dumps(location_state))
 
     # This turn's action is unknown until the player's next call updates it
     await take_action_db(game_id=game_id, action="", result=response["result"], turn_number=turn_number, stats=stats_str,
@@ -323,6 +401,11 @@ async def take_action(game_id: str, action: TurnInput):
             in_combat=combat_state["in_combat"],
             enemy_name=enemy["name"] if enemy else None,
             enemy_hp=enemy["hp"] if enemy else None
+        ),
+        location=LocationInfo(
+            current_location=current_location["name"],
+            visited_locations=location_state["visited_locations"],
+            available_exits=[name for _, name in current_exits]
         )
     )
     return turn
@@ -360,6 +443,13 @@ async def load_game(load_input: LoadInput):
     combat_state = json.loads(combat_row[0]) if combat_row and combat_row[0] else {"in_combat": False}
     enemy = combat_state.get("enemy")
 
+    location_row = await get_location_state(game_id)
+    location_state = json.loads(location_row[0]) if location_row and location_row[0] else {
+        "current_location": STARTING_LOCATION_ID, "visited_locations": [STARTING_LOCATION_ID]
+    }
+    current_location = location_to_dict(await get_location(location_state["current_location"]))
+    exits = await get_location_exits(location_state["current_location"])
+
     return LoadedGame(
         game_id=game_id,
         scene=turn_row[4],
@@ -370,5 +460,10 @@ async def load_game(load_input: LoadInput):
             in_combat=combat_state.get("in_combat", False),
             enemy_name=enemy["name"] if enemy else None,
             enemy_hp=enemy["hp"] if enemy else None
+        ),
+        location=LocationInfo(
+            current_location=current_location["name"],
+            visited_locations=location_state["visited_locations"],
+            available_exits=[name for _, name in exits]
         )
     )

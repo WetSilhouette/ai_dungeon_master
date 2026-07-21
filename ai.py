@@ -54,22 +54,36 @@ def normalize_action(item) -> str:
     return str(item)
 
 
-async def start_game(game_input) -> dict:
+def location_prompt_block(location: dict | None, arriving: bool = False) -> str:
+    if not location:
+        return ""
+    block = f"""Current location: {location['name']} - {location['description']} (atmosphere: {location['atmosphere']})."""
+    if arriving:
+        block += (" The player has just arrived here - describe their arrival and first impressions of this"
+                   " specific place, grounded in its atmosphere, not a continuation of wherever they were before.")
+    return block
+
+
+async def start_game(game_input, location: dict | None = None) -> dict:
     """"Come up with unique game like D&D according to input data"""
 
+    location_block = location_prompt_block(location)
     prompt = f"""You are a dungeon master. Start a {game_input.setting}
-                adventure for a player named {game_input.player_name}. Write a 3-5 sentence opening scene. 
-                Then provide exactly 3 possible actions as a JSON array. 
-                Return ONLY valid JSON using double quotes for all keys and strings. 
+                adventure for a player named {game_input.player_name}. {location_block}
+                Write a 3-5 sentence opening scene grounded in this location.
+                Then provide exactly 3 possible actions as a JSON array.
+                Return ONLY valid JSON using double quotes for all keys and strings.
                 Do not use single quotes or Python dict syntax.
                 Return ONLY: {JSON_FORMAT}"""
     result = await model_response(prompt)
     return result
 
 
-async def continue_game(game_history, stats) -> dict:
+async def continue_game(game_history, stats, location: dict | None = None, arriving: bool = False) -> dict:
+    location_block = location_prompt_block(location, arriving=arriving)
     prompt = f"""You are a dungeon master. Continue a game with such actions history and world building {game_history}.
                 Current character stats: {json.dumps(stats)}.
+                {location_block}
                 Write a 3-5 sentence continuation scene that reflects the outcome of the player's latest action.
                 Then provide exactly 3 possible actions as a JSON array.
                 If the latest action changes HP, gold, or inventory in any way (taking damage, defeating an
