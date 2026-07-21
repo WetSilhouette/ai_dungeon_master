@@ -11,6 +11,7 @@ TURN_JSON_FORMAT = {
     "actions": ["...", "...", "..."],
     "updates": {"hp": -15, "gold": 10, "inventory": {"add": ["item"], "remove": ["item"]}}
 }
+COMBAT_STATE_JSON = {"in_combat": "true", "enemy": {"name": "Goblin", "hp": 30, "attack": 8}}
 
 
 def clean_response(raw):
@@ -75,10 +76,26 @@ async def continue_game(game_history, stats) -> dict:
                 enemy, looting, finding or using an item, etc.), you MUST include an "updates" key with deltas
                 for only the fields that changed (e.g. -15 for damage taken, 10 for gold found). Omit "updates"
                 entirely only if nothing changed.
+                If your scene introduces a hostile enemy that the player must now fight, include a "combat" key
+                describing it: {COMBAT_STATE_JSON}. Give the enemy an hp and attack value that is a fair
+                challenge for the player's own stats. Omit "combat" entirely if no new fight is starting right now.
                 Return ONLY valid JSON in this exact shape, using double quotes for all keys and strings: {TURN_JSON_FORMAT}"""
 
     result = await model_response(prompt)
     return result
+
+
+async def narrate_combat(outcome_summary: str) -> str:
+    """Narrate one combat round whose numbers were already decided by game logic - do not invent different ones."""
+    prompt = f"""You are a dungeon master narrating one round of combat that has already been resolved by the
+                game's rules. Exactly what happened: {outcome_summary}
+                Write 2-3 vivid sentences narrating exactly this outcome. Do not change the damage numbers or
+                the result described above. Return ONLY the narration as plain text - no JSON, no quotes."""
+    response: ChatResponse = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return clean_response(response.message.content)
 
 
 if __name__ == "__main__":

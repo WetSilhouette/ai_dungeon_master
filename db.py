@@ -4,6 +4,7 @@ import asyncio
 from runpy import run_path
 
 import aiosqlite
+from pydantic import with_config
 
 DB_PATH = "games.db"
 
@@ -16,6 +17,7 @@ async def init_db() -> None:
             game_id TEXT UNIQUE,
             player_name TEXT NOT NULL,
             setting TEXT NOT NULL,
+            combat_state TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)
         """)
         await db.commit()
@@ -101,6 +103,30 @@ async def update_action(game_id: str, action: str, turn_number: int) -> int:
         return cursor.lastrowid
 
 
+# Update combat state in games table
+async def update_combat_state(game_id: str, combat_state_json: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            UPDATE games
+            SET combat_state = ?
+            WHERE game_id = ?
+            """,
+            (combat_state_json, game_id)
+            )
+        await db.commit()
+        return cursor.lastrowid
+
+
+# Get combat state
+async def get_combat_state(game_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT combat_state
+            FROM games
+            WHERE game_id = ?
+        """, (game_id,))
+        await db.commit()
+        return await cursor.fetchone()
 
 
 
