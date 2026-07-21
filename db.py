@@ -45,6 +45,10 @@ async def init_db() -> None:
             combat_state TEXT DEFAULT NULL,
             location_state TEXT DEFAULT NULL,
             combat_wins INTEGER DEFAULT 0,
+            gold_collected INTEGER DEFAULT 0,
+            ended INTEGER DEFAULT 0,
+            summary_title TEXT DEFAULT NULL,
+            summary_text TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)
         """)
         await db.commit()
@@ -316,6 +320,56 @@ async def award_achievement(game_id: str, achievement_id: str, earned_at: str) -
         await db.execute(
             "INSERT OR IGNORE INTO achievements (game_id, achievement_id, earned_at) VALUES (?, ?, ?)",
             (game_id, achievement_id, earned_at)
+        )
+        await db.commit()
+
+
+# Mark a game as manually ended
+async def mark_game_ended(game_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE games SET ended = 1 WHERE game_id = ?", (game_id,))
+        await db.commit()
+
+
+# Check whether a game was manually ended
+async def is_game_ended(game_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT ended FROM games WHERE game_id = ?", (game_id,))
+        row = await cursor.fetchone()
+        return bool(row and row[0])
+
+
+# Add to a game's lifetime gold-collected counter
+async def increment_gold_collected(game_id: str, amount: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE games SET gold_collected = gold_collected + ? WHERE game_id = ?",
+            (amount, game_id)
+        )
+        await db.commit()
+
+
+# Get a game's lifetime gold-collected total
+async def get_gold_collected(game_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT gold_collected FROM games WHERE game_id = ?", (game_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+# Get a game's cached summary, if generated
+async def get_summary(game_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT summary_title, summary_text FROM games WHERE game_id = ?", (game_id,))
+        return await cursor.fetchone()
+
+
+# Cache a generated summary
+async def save_summary(game_id: str, title: str, summary_text: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE games SET summary_title = ?, summary_text = ? WHERE game_id = ?",
+            (title, summary_text, game_id)
         )
         await db.commit()
 

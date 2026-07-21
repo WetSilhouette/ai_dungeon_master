@@ -99,6 +99,18 @@ async def continue_game(game_history, stats, location: dict | None = None, arriv
     return result
 
 
+async def generate_summary(full_story: str) -> dict:
+    prompt = f"""You are a dungeon master writing the closing recap of a finished tabletop adventure.
+                Here is the full story, turn by turn:
+                {full_story}
+                Write a 2-3 paragraph narrative summary of this adventure, along with a short evocative title.
+                Base the summary on what actually happened in the story above, not just a generic recap.
+                Return ONLY valid JSON using double quotes for all keys and strings, in this exact shape:
+                {{"title": "...", "summary": "..."}}"""
+    result = await model_response(prompt)
+    return result
+
+
 async def narrate_combat(outcome_summary: str) -> str:
     """Narrate one combat round whose numbers were already decided by game logic - do not invent different ones."""
     prompt = f"""You are a dungeon master narrating one round of combat that has already been resolved by the

@@ -14,10 +14,14 @@ from db import (
     init_db, save_game, take_action_db, get_game_history, get_last_turn, update_action,
     get_combat_state, update_combat_state, get_game, create_save, get_save,
     get_location, get_location_exits, get_location_state, update_location_state,
-    increment_combat_wins, get_combat_wins, get_earned_achievements, award_achievement
+    increment_combat_wins, get_combat_wins, get_earned_achievements, award_achievement,
+    mark_game_ended, is_game_ended, increment_gold_collected, get_gold_collected,
+    get_summary, save_summary
 )
 from contextlib import asynccontextmanager
-from ai import start_game, continue_game, narrate_combat
+from ai import start_game, continue_game, narrate_combat, generate_summary
+
+MAX_TURNS = 30
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -149,6 +153,35 @@ class LoadedGame(BaseModel):
     location: LocationInfo = Field(default_factory=LocationInfo, description="Location at the point of saving")
 
 
+class EndResponse(BaseModel):
+    ended: bool = Field(..., description="Whether the game is now over")
+
+
+class SummaryStats(BaseModel):
+    turns_played: int = Field(..., description="Number of turns played")
+    enemies_defeated: int = Field(..., description="Number of combats won")
+    gold_collected: int = Field(..., description="Lifetime gold collected, not current balance")
+    locations_visited: List[str] = Field(default_factory=list, description="Locations visited during the game")
+    achievements: List[str] = Field(default_factory=list, description="Achievements earned during the game")
+
+
+class SummaryResponse(BaseModel):
+    title: str = Field(..., description="Title of the adventure")
+    summary: str = Field(..., description="2-3 paragraph narrative summary")
+    stats: SummaryStats = Field(..., description="Final stats for the completed game")
+
+
+class ReplayTurn(BaseModel):
+    turn: int = Field(..., description="Turn number")
+    action: str = Field(..., description="Action taken at this turn, if any")
+    result: str = Field(..., description="Narrated result of this turn")
+
+
+class ReplayResponse(BaseModel):
+    game_id: str = Field(..., description="Unique identifier of the Game")
+    turns: List[ReplayTurn] = Field(default_factory=list, description="All turns in chronological order")
+
+
 def apply_stat_updates(stats: dict, updates: dict) -> dict:
     for key in ("hp", "attack", "defence", "gold"):
         delta = updates.get(key)
@@ -211,6 +244,16 @@ async def check_achievements(game_id: str, ctx: dict) -> List[str]:
 def detect_combat_trigger(text: str) -> bool:
     lowered = text.lower()
     return any(trigger in lowered for trigger in COMBAT_TRIGGER_WORDS)
+
+
+async def game_has_ended(game_id: str) -> bool:
+    """A game is over on death, at the turn cap, or once manually ended via /end."""
+    if await is_game_ended(game_id):
+        return True
+    turn_row = await get_last_turn(game_id)
+    stats = ast.literal_eval(turn_row[5])
+    turn_number = turn_row[2]
+    return stats["hp"] <= 0 or turn_number >= MAX_TURNS
 
 
 def roll_damage(attack: int) -> int:
@@ -345,7 +388,7 @@ async def take_action(game_id: str, action: TurnInput):
 
         await update_combat_state(game_id, json.dumps(combat_state))
 
-        game_over = stats["hp"] <= 0
+        game_over = stats["hp"] <= 0 or turn_number >= MAX_TURNS
         stats_str = str(stats)
         await take_action_db(game_id=game_id, action="", result=result_text, turn_number=turn_number, stats=stats_str,
                               actions=json.dumps(actions))
@@ -398,8 +441,11 @@ async def take_action(game_id: str, action: TurnInput):
 
     updates = response.get("updates")
     if isinstance(updates, dict):
+        gold_delta = updates.get("gold")
+        if isinstance(gold_delta, (int, float)) and gold_delta > 0:
+            await increment_gold_collected(game_id, int(gold_delta))
         stats = apply_stat_updates(stats, updates)
-    game_over = stats["hp"] <= 0
+    game_over = stats["hp"] <= 0 or turn_number >= MAX_TURNS
     stats_str = str(stats)
 
     combat_start = response.get("combat")
@@ -523,3 +569,69 @@ async def get_achievements(game_id: str):
     earned_ids = {row[0] for row in await get_earned_achievements(game_id)}
     names = [a["name"] for a in ACHIEVEMENTS if a["id"] in earned_ids]
     return AchievementsResponse(achievements=names)
+
+
+@app.post("/games/{game_id}/end", response_model=EndResponse)
+async def end_game(game_id: str):
+    if await get_game(game_id) is None:
+        raise HTTPException(status_code=404, detail="No game found with that id")
+
+    await mark_game_ended(game_id)
+    return EndResponse(ended=True)
+
+
+@app.get("/games/{game_id}/summary", response_model=SummaryResponse)
+async def get_game_summary(game_id: str):
+    if await get_game(game_id) is None:
+        raise HTTPException(status_code=404, detail="No game found with that id")
+
+    if not await game_has_ended(game_id):
+        raise HTTPException(status_code=400, detail="Game hasn't ended yet")
+
+    cached = await get_summary(game_id)
+    title, summary_text = (cached[0], cached[1]) if cached else (None, None)
+
+    if not title or not summary_text:
+        history = list(reversed(await get_game_history(game_id)))
+        story_lines = []
+        for row in history:
+            turn_number, action, result = row[2], row[3], row[4]
+            story_lines.append(f"Turn {turn_number}: {result}")
+            if action:
+                story_lines.append(f"The player then chose to: {action}")
+        full_story = "\n".join(story_lines)
+
+        generated = await generate_summary(full_story)
+        title = generated["title"]
+        summary_text = generated["summary"]
+        await save_summary(game_id, title, summary_text)
+
+    turn_row = await get_last_turn(game_id)
+    location_row = await get_location_state(game_id)
+    location_state = json.loads(location_row[0]) if location_row and location_row[0] else {
+        "current_location": STARTING_LOCATION_ID, "visited_locations": [STARTING_LOCATION_ID]
+    }
+    earned_ids = {row[0] for row in await get_earned_achievements(game_id)}
+    achievement_names = [a["name"] for a in ACHIEVEMENTS if a["id"] in earned_ids]
+
+    return SummaryResponse(
+        title=title,
+        summary=summary_text,
+        stats=SummaryStats(
+            turns_played=turn_row[2],
+            enemies_defeated=await get_combat_wins(game_id),
+            gold_collected=await get_gold_collected(game_id),
+            locations_visited=location_state["visited_locations"],
+            achievements=achievement_names
+        )
+    )
+
+
+@app.get("/games/{game_id}/replay", response_model=ReplayResponse)
+async def get_replay(game_id: str):
+    if await get_game(game_id) is None:
+        raise HTTPException(status_code=404, detail="No game found with that id")
+
+    history = list(reversed(await get_game_history(game_id)))
+    turns = [ReplayTurn(turn=row[2], action=row[3], result=row[4]) for row in history]
+    return ReplayResponse(game_id=game_id, turns=turns)
